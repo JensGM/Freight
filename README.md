@@ -4,3 +4,10 @@
 - bin/header - freight file header (ruby)
 - tarballs - tools / rootfs
 - dask-sima.yml - example config
+
+
+# Running
+
+```sh
+./bin/freight dask-sima.yml
+```
