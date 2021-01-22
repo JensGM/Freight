@@ -10,4 +10,5 @@
 
 ```sh
 ./bin/freight dask-sima.yml
+./dask-sima.freight bash
 ```
