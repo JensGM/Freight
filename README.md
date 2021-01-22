@@ -6,7 +6,7 @@
 - dask-sima.yml - example config
 
 
-# Running
+## Running
 
 ```sh
 ./bin/freight dask-sima.yml
