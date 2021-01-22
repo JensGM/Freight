@@ -1,0 +1,171 @@
+#!/usr/bin/env ruby
+require 'fileutils'
+require 'shellwords'
+
+freight_dir = File.join(__dir__, "#{File.basename __FILE__}.root")
+
+freight_extracted_file = File.join freight_dir, '.freight/extracted'
+freight_permissions_file = File.join freight_dir, '.freight/permissions'
+freight_symlink_file = File.join freight_dir, '.freight/symlink'
+freight_patched_file = File.join freight_dir, '.freight/patched'
+
+def sysecho cmd, errors_are_fatal=true
+    puts cmd
+    if !system(cmd) && errors_are_fatal
+        abort "Failed: #{cmd}"
+    end
+end
+
+puts freight_dir
+
+#
+# Extract freight
+#
+
+if !File.exist? freight_extracted_file
+    puts "extracting freight..."
+
+    FileUtils.mkdir_p File.join(freight_dir, '.freight')
+
+    read_io, write_io = IO.pipe
+    tar_proc = fork do
+        write_io.close
+        STDIN.reopen read_io
+        exec "tar -zxvf - -C #{freight_dir}"
+    end
+
+    read_io.close
+    archive = DATA.read
+    write_io.write archive
+    write_io.close
+
+    Process.wait tar_proc
+
+    FileUtils.touch freight_extracted_file
+end
+
+puts 'indexing...'
+freight_files = Dir[ File.join freight_dir, '**', '*' ]
+
+#
+# Ensure permissions
+#
+
+if !File.exist? freight_permissions_file
+    puts 'Ensuring directory permissions...'
+    freight_files
+        .select { |path| File.directory? path }
+        .each { |path| FileUtils.chmod 'u+rwx', path }
+    FileUtils.touch freight_permissions_file
+end
+
+#
+# Rewrite symlinks
+#
+
+if !File.exist? freight_symlink_file
+    puts 'Rewriting symlinks...'
+
+    binds_file = File.join(freight_dir, '.freight/binds')
+    binds = (File.exist? binds_file) ? (File.readlines binds_file) : []
+
+    symlinks = freight_files
+        .select { |path|
+            !binds.include? path and
+            File.symlink? path and
+            File.readlink(path).start_with? '/'
+        }
+
+    symlinks.each { |ln|
+        target = File.readlink ln
+        rooted_target = File.join freight_dir, target
+        puts "#{ln} -> #{target}"
+        # FileUtils.symlink rooted_target, ln, force: true
+        sysecho "ln -sfn #{rooted_target} #{ln}"
+    }
+
+    FileUtils.touch freight_symlink_file
+end
+
+
+#
+# Patch ELF binaries
+#
+
+if !File.exist? freight_patched_file
+    puts "patching ELF binaries..."
+
+    patchelf = File.join freight_dir, 'usr/bin/patchelf'
+    general_rpath = [
+            '/lib',
+            '/lib64',
+            '/usr/lib',
+            '/usr/lib64',
+            'lib/x86_64-linux-gnu/',
+            '/usr/lib/systemd',
+            '/usr/lib64',
+            '/usr/lib64/bind9-export',
+            '/usr/lib64/sasl2',
+            '/usr/lib64/gconv',
+            '/usr/libexec/coreutils',
+        ]
+        .map{ |path| File.join freight_dir, path }
+        .select { |path| File.exists? path }
+        .join(':')
+
+    elf_files = freight_files
+        .reject { |path|
+            File.directory? path or
+            File.symlink? path or
+            path =~ /ld[^\/]*\.so/ or # ignore ld.so, it's static anyway
+            path.include? 'patchelf' # patchelf should be runnable anywhere
+        }
+        .select { |path| File.open(path) { |f|
+            magic = f.read(4)
+            magic && magic.unpack('N').first == 0x7f454c46
+        }}
+
+    interpreter = elf_files.find { |prog|
+        candidate = `#{patchelf} --print-interpreter #{prog} 2> /dev/null`
+            .strip
+        break candidate if !candidate.empty?
+    }
+    interpreter = File.realpath File.join(freight_dir, interpreter)
+
+    # Stop the interpreter from reading ld.so.cache as this could let it load
+    # libraries from the host system.
+    sysecho "sed -i -e 's|/lib|/xib|g' #{interpreter}"
+    sysecho "sed -i -e 's|/etc|/xtc|g' #{interpreter}"
+
+    elf_files.each { |prog|
+        old_rpath = `#{patchelf} --print-rpath #{prog}`.strip
+        rpath = general_rpath
+        if !old_rpath.empty?
+            rpath += ':' + old_rpath
+        end
+        rpath = Shellwords.escape(rpath)
+
+        if !`readelf -l #{prog} | grep INTERP`.strip.empty?
+            sysecho "#{patchelf} --set-interpreter #{interpreter} #{prog}", false
+        end
+
+        sysecho "#{patchelf} --set-rpath #{rpath} #{prog}", false
+    }
+
+    FileUtils.touch freight_patched_file
+end
+
+#
+# Start program
+#
+
+chroot = ['sbin/chroot', 'usr/sbin/chroot'].find { |p|
+    path = File.join(freight_dir, p)
+    break path if File.exist? path
+}
+ENV['LD_PRELOAD'] = File
+    .realpath File.join(freight_dir, 'usr/lib/fakechroot/libfakechroot.so')
+ENV['FAKECHROOT_EXCLUDE_PATH'] = '/proc:/dev:/sys'
+exec chroot, freight_dir, *ARGV
+
+__END__

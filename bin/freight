@@ -1,0 +1,195 @@
+#!/usr/bin/env ruby
+require "fileutils"
+require 'digest'
+require 'tmpdir'
+require 'yaml'
+
+def main
+    name = File.basename ARGV[0], '.*'
+    workdir = "#{name}.freightdir"
+
+    spec = YAML.load_file(ARGV[0])
+        .map { |e| e.to_a }
+        .flatten(1)
+
+    entrypoint, spec = spec.partition { |e| e.first == 'ENTRYPOINT' }
+    binds, spec = spec.partition { |e| e.first == 'BIND' }
+
+    # Check spec
+
+    if entrypoint.length == 1
+        entrypoint = entrypoint.first
+    else
+        abort('more than one entrypoint specified')
+    end
+
+    spec.each { |e|
+        if !['ADD', 'RUN', 'ENV'].include? e.first
+            abort("unsupported directive: #{e}")
+        end
+    }
+
+    prepare_workdir workdir
+    layers = build_layers spec, workdir
+    create_entrypoint entrypoint, workdir
+    create_binds binds, workdir
+    compile name, layers, workdir
+end
+
+def prepare_workdir workdir
+    FileUtils.mkdir_p workdir
+    FileUtils.mkdir_p File.join(workdir, 'completed')
+    FileUtils.mkdir_p File.join(workdir, 'root/.freight')
+end
+
+def build_layers spec, workdir
+    layers = []
+    sha256 = Digest::SHA256.new
+
+    for directive in spec
+        sha256.update directive.to_s
+        hash = sha256.hexdigest
+
+        puts "Runnig #{directive}"
+        sleep 0.5 # Prevents some errors
+        layers.push case directive.first
+        when 'ADD'
+            add_layer(directive.last, workdir, hash)
+        when 'RUN'
+            run_layer(directive.last, workdir, layers, hash)
+        when 'ENV'
+            env_layer(directive.last, workdir, hash)
+        end
+    end
+
+    return layers
+end
+
+def create_entrypoint entrypoint, workdir
+    if !entrypoint then return end
+
+    path = File.join workdir, 'root/.freight/entrypoint'
+    File.open(path, 'w') { |f| f.write entrypoint.last }
+    FileUtils.chmod '+x', path
+end
+
+def create_binds binds, workdir
+    root_path = File.join workdir, 'root'
+    binds.each { |e|
+        from, to = e.last.split ':'
+        to = File.join(root_path, to).chomp('/') # Trailing slashes don't work
+
+        # Ensure path extists
+        FileUtils.mkdir_p File.dirname(to)
+
+        if !File.exist? to
+            File.symlink from, to
+        end
+
+        File.open(File.join(root_path, '.freight/binds'), 'a') { |f|
+            f.puts to
+        }
+    }
+end
+
+def compile name, layers, workdir
+    hash = layers.last
+
+    root_path = File.join workdir, 'root'
+    archive_path = File.join workdir, "#{hash[0...10]}.rootfs.tar.gz"
+    freight_path = "#{name}.freight"
+
+    cmd = "tar -czf #{archive_path} -C #{root_path} ."
+    puts cmd
+    if !system(cmd)
+        abort("Failed: #{cmd}")
+    end
+
+    File.open(freight_path, 'wb') { |f|
+        File.open('bin/header') { |header|
+            f.write header.read
+        }
+        File.open(archive_path, 'rb') { |archive|
+            f.write archive.read
+        }
+    }
+    FileUtils.chmod '+x', freight_path
+end
+
+def add_layer directive, workdir, hash
+    layer_dir = File.join workdir, 'root'
+
+    if completed workdir, hash
+        puts 'skipping'
+        return hash
+    end
+
+    archive, destination = directive.split(/(?<!\\)\s+/)
+    dest_dir = File.join layer_dir, destination
+    FileUtils.mkdir_p dest_dir
+    cmd = "tar -xf #{archive} -C #{dest_dir}"
+    puts cmd
+    if !system(cmd)
+        abort("Failed: #{cmd}")
+    end
+
+    mark_completed workdir, hash
+
+    return hash
+end
+
+def run_layer cmd, workdir, layers, hash
+    layer_dir = File.join workdir, 'root'
+
+    if completed workdir, hash
+        puts 'skipping'
+        return hash
+    end
+
+    FileUtils.mkdir_p layer_dir
+
+    # unionfs(layer_dirs, layer_dir) { |mnt|
+    #     `proot -S #{mnt} #{cmd}`
+    # }
+    cmd = "proot --cwd=/ --kill-on-exit -S #{layer_dir} #{cmd}"
+    puts cmd
+    if !system(cmd)
+        abort("Failed: #{cmd}")
+    end
+
+
+    mark_completed workdir, hash
+
+    return hash
+end
+
+def env_layer directive, workdir, hash
+    return hash
+end
+
+# def unionfs ro_layers, rw_layer=nil
+#     options = []
+#     options.push 'cow' if rw_layer # enable copy-on-write if write layer
+#     options = options.join ','
+#
+#     layers = ro_layers.map { |l| l + '=RO' }
+#     layers.push(rw_layer + '=RW') if rw_layer
+#     layers = layers.reverse.join ':'
+#     puts layers
+#
+#     Dir.mktmpdir { |mntpnt|
+#         `unionfs -o#{options} #{layers} #{mntpnt}`
+#         yield mntpnt
+#         `fusermount -u #{mntpnt}`
+#     }
+# end
+
+def completed workdir, hash
+    File.exist? File.join(workdir, 'completed', hash)
+end
+
+def mark_completed workdir, hash
+    FileUtils.touch File.join(workdir, 'completed', hash)
+end
+
+main

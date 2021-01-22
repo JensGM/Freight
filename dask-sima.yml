@@ -1,0 +1,21 @@
+- ADD: tarballs/centos-8.tar.gz /
+- ADD: tarballs/patchelf-0.12.tar.gz /usr/
+- ADD: tarballs/fakechroot-2.20.1.tar.gz /usr/
+
+- RUN: yum install -y python3 java-11-openjdk
+- RUN: yum install -y gcc gcc-c++ make
+- RUN: yum install -y python3-devel
+- RUN: pip3 install dask-jobqueue
+
+- BIND: /private/:/private/
+
+- ENV:
+    PATH: /sima:$PATH
+    MARINTEK_LICENSE_FILE: /sima/SIMA_Equinor_RDI.lic
+    EXECUTION_ROOT_PATH: /
+
+- ENTRYPOINT: |
+    #!/usr/bin/env python3
+    from dask_jobqueue import PBSCluster
+    cluster = PBSCluster(cores=15, memory='24GB')
+    cluster.adapt(0, 20)
